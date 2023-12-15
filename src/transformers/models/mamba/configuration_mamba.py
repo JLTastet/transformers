@@ -3,6 +3,7 @@
 
 from ...configuration_utils import PretrainedConfig
 
+
 MAMBA_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "state-spaces/mamba-2.8b": "https://huggingface.co/state-spaces/mamba-2.8b/resolve/main/config.json",
     "state-spaces/mamba-1.4b": "https://huggingface.co/state-spaces/mamba-1.4b/resolve/main/config.json",
@@ -27,8 +28,8 @@ DEFAULT_SSM_CONFIG = {
     "use_fast_path": True,
 }
 
-class MambaConfig(PretrainedConfig):
 
+class MambaConfig(PretrainedConfig):
     model_type = "mamba"
 
     def __init__(
@@ -36,8 +37,8 @@ class MambaConfig(PretrainedConfig):
         vocab_size=50277,
         n_layer=64,
         d_model=2560,
-        ssm_cfg=DEFAULT_SSM_CONFIG, # TODO: refactor?
-        norm_epsilon = 1e-5,
+        ssm_cfg=DEFAULT_SSM_CONFIG,  # TODO: refactor?
+        norm_epsilon=1e-5,
         rms_norm=True,
         residual_in_fp32=True,
         fused_add_norm=True,
@@ -46,18 +47,18 @@ class MambaConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=0,
         pad_token_id=1,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)
 
-        self.vocab_size=vocab_size
-        self.n_layer=n_layer
-        self.d_model=d_model
-        self.norm_epsilon =norm_epsilon
-        self.rms_norm=rms_norm
-        self.residual_in_fp32=residual_in_fp32
-        self.fused_add_norm=fused_add_norm
-        self.pad_vocab_size_multiple=pad_vocab_size_multiple
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.d_model = d_model
+        self.norm_epsilon = norm_epsilon
+        self.rms_norm = rms_norm
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.pad_vocab_size_multiple = pad_vocab_size_multiple
 
-        self.ssm_cfg=ssm_cfg
-        self.initializer_cfg=initializer_cfg
+        self.ssm_cfg = ssm_cfg
+        self.initializer_cfg = initializer_cfg

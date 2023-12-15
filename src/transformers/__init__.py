@@ -2515,8 +2515,8 @@ else:
         [
             "MAMBA_PRETRAINED_MODEL_ARCHIVE_LIST",
             "Mamba",
-            "MambaModel",
             "MambaForCausalLM",
+            "MambaModel",
             "MambaPreTrainedModel",
         ]
     )
@@ -6977,8 +6977,8 @@ if TYPE_CHECKING:
         from .models.mamba import (
             MAMBA_PRETRAINED_MODEL_ARCHIVE_LIST,
             Mamba,
-            MambaModel,
             MambaForCausalLM,
+            MambaModel,
             MambaPreTrainedModel,
         )
         from .models.marian import MarianForCausalLM, MarianModel, MarianMTModel

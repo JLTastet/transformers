@@ -2,44 +2,44 @@
 # Copyright (c) 2023 the contributors (see AUTHORS)
 # Based on various files from https://github.com/state-spaces/mamba
 
+import gc
+import json
+import math
+import os
+import platform
+import subprocess
 import sys
 import warnings
-import os
-from pathlib import Path
-from packaging.version import parse, Version
-import subprocess
-
-import math
+from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import Callable, Optional, Sequence, Union
 
-from collections import namedtuple
-from dataclasses import dataclass, field
-import json
-
+import causal_conv1d_cuda
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-from torch.nn import CrossEntropyLoss
-from torch.cuda.amp import custom_fwd, custom_bwd
-from torch.utils.cpp_extension import load, CUDA_HOME
-
 import triton
 import triton.language as tl
+from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 # TODO: add new (optional?) dependencies to transformers
 from einops import rearrange, repeat
+from packaging.version import Version, parse
+from torch import Tensor
+from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.nn import CrossEntropyLoss
+from torch.utils.cpp_extension import CUDA_HOME, load
 
-from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-import causal_conv1d_cuda
-
-
+from ...generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
 from ...modeling_outputs import BaseModelOutput, CausalLMOutput
 from ...modeling_utils import PreTrainedModel
-from ...utils import logging
-logger = logging.get_logger(__name__)
+from ...utils import CONFIG_NAME, WEIGHTS_NAME, logging
+from ...utils.hub import cached_file
 from .configuration_mamba import MambaConfig
+
+
+logger = logging.get_logger(__name__)
 
 
 MAMBA_PRETRAINED_CONFIG_ARCHIVE_LIST = [
@@ -53,21 +53,17 @@ MAMBA_PRETRAINED_CONFIG_ARCHIVE_LIST = [
 
 
 def load_cuda_kernels():
-
     # ninja build does not work unless include_dirs are abs path
     this_dir = os.path.dirname(os.path.abspath(__file__))
     root_dir = Path(this_dir).parent.parent
 
     PACKAGE_NAME = "mamba_ssm"
 
-    # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
     # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-    FORCE_BUILD = os.getenv("MAMBA_FORCE_BUILD", "FALSE") == "TRUE"
     SKIP_CUDA_BUILD = os.getenv("MAMBA_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
     VERBOSE_CUDA_BUILD = os.getenv("MAMBA_VERBOSE_CUDA_BUILD", "FALSE") == "TRUE"
     # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
     FORCE_CXX11_ABI = os.getenv("MAMBA_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-
 
     def get_platform():
         """
@@ -83,17 +79,13 @@ def load_cuda_kernels():
         else:
             raise ValueError("Unsupported platform: {}".format(sys.platform))
 
-
     def get_cuda_bare_metal_version(cuda_dir):
-        raw_output = subprocess.check_output(
-            [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
-        )
+        raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
         output = raw_output.split()
         release_idx = output.index("release") + 1
         bare_metal_version = parse(output[release_idx].split(",")[0])
 
         return raw_output, bare_metal_version
-
 
     def check_if_cuda_home_none(global_option: str) -> None:
         if CUDA_HOME is not None:
@@ -106,18 +98,11 @@ def load_cuda_kernels():
             "only images whose names contain 'devel' will provide nvcc."
         )
 
-
     def append_nvcc_threads(nvcc_extra_args):
         return nvcc_extra_args + ["--threads", "4"]
 
-
-    cmdclass = {}
-    ext_modules = []
-
     if not SKIP_CUDA_BUILD:
         print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
-        TORCH_MAJOR = int(torch.__version__.split(".")[0])
-        TORCH_MINOR = int(torch.__version__.split(".")[1])
 
         check_if_cuda_home_none(PACKAGE_NAME)
         # Check, if CUDA11 is installed for compute capability 8.0
@@ -144,7 +129,7 @@ def load_cuda_kernels():
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        module = load(
+        load(
             name="selective_scan_cuda",
             sources=[
                 root_dir / "kernels/mamba/selective_scan.cpp",
@@ -182,20 +167,16 @@ def load_cuda_kernels():
             verbose=VERBOSE_CUDA_BUILD,
         )
 
+
 load_cuda_kernels()
 import selective_scan_cuda
 
 
-from ...generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
-from ...utils import WEIGHTS_NAME, CONFIG_NAME
-from ...utils.hub import cached_file
-
-
 class SelectiveScanFn(torch.autograd.Function):
-
     @staticmethod
-    def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                return_last_state=False):
+    def forward(
+        ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False
+    ):
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -240,22 +221,41 @@ class SelectiveScanFn(torch.autograd.Function):
         # backward of selective_scan_cuda with the backward of chunk).
         # Here we just pass in None and dz will be allocated in the C++ code.
         du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
-            u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
-            False  # option to recompute out_z, not used here
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z,
+            delta_bias,
+            dout,
+            x,
+            out,
+            None,
+            ctx.delta_softplus,
+            False,  # option to recompute out_z, not used here
         )
         dz = rest[0] if ctx.has_z else None
         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
         dC = dC.squeeze(1) if getattr(ctx, "squeeze_C", False) else dC
-        return (du, ddelta, dA, dB, dC,
-                dD if D is not None else None,
-                dz,
-                ddelta_bias if delta_bias is not None else None,
-                None,
-                None)
+        return (
+            du,
+            ddelta,
+            dA,
+            dB,
+            dC,
+            dD if D is not None else None,
+            dz,
+            ddelta_bias if delta_bias is not None else None,
+            None,
+            None,
+        )
 
 
-def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                     return_last_state=False):
+def selective_scan_fn(
+    u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False
+):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
@@ -263,8 +263,9 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
-def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                      return_last_state=False):
+def selective_scan_ref(
+    u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False
+):
     """
     u: r(B D L)
     delta: r(B D L)
@@ -298,33 +299,33 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         C = C.float()
     x = A.new_zeros((batch, dim, dstate))
     ys = []
-    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    deltaA = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
     if not is_variable_B:
-        deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+        deltaB_u = torch.einsum("bdl,dn,bdl->bdln", delta, B, u)
     else:
         if B.dim() == 3:
-            deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+            deltaB_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
         else:
             B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
-            deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+            deltaB_u = torch.einsum("bdl,bdnl,bdl->bdln", delta, B, u)
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
     for i in range(u.shape[2]):
         x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
         if not is_variable_C:
-            y = torch.einsum('bdn,dn->bd', x, C)
+            y = torch.einsum("bdn,dn->bd", x, C)
         else:
             if C.dim() == 3:
-                y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                y = torch.einsum("bdn,bn->bd", x, C[:, :, i])
             else:
-                y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+                y = torch.einsum("bdn,bdn->bd", x, C[:, :, :, i])
         if i == u.shape[2] - 1:
             last_state = x
         if y.is_complex():
             y = y.real * 2
         ys.append(y)
-    y = torch.stack(ys, dim=2) # (batch dim L)
+    y = torch.stack(ys, dim=2)  # (batch dim L)
     out = y if D is None else y + u * rearrange(D, "d -> d 1")
     if z is not None:
         out = out * F.silu(z)
@@ -333,15 +334,29 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
 
 
 class MambaInnerFn(torch.autograd.Function):
-
     @staticmethod
     @custom_fwd
-    def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-                out_proj_weight, out_proj_bias,
-                A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-                C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1):
+    def forward(
+        ctx,
+        xz,
+        conv1d_weight,
+        conv1d_bias,
+        x_proj_weight,
+        delta_proj_weight,
+        out_proj_weight,
+        out_proj_bias,
+        A,
+        B=None,
+        C=None,
+        D=None,
+        delta_bias=None,
+        B_proj_bias=None,
+        C_proj_bias=None,
+        delta_softplus=True,
+        checkpoint_lvl=1,
+    ):
         """
-             xz: (batch, dim, seqlen)
+        xz: (batch, dim, seqlen)
         """
         assert checkpoint_lvl in [0, 1]
         L = xz.shape[-1]
@@ -351,8 +366,9 @@ class MambaInnerFn(torch.autograd.Function):
             x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
             delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
             out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype())
-                             if out_proj_bias is not None else None)
+            out_proj_bias = (
+                out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype()) if out_proj_bias is not None else None
+            )
         if xz.stride(-1) != 1:
             xz = xz.contiguous()
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
@@ -362,14 +378,14 @@ class MambaInnerFn(torch.autograd.Function):
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-        x_dbl = F.linear(rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
-        delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l = L)
+        x_dbl = F.linear(rearrange(conv1d_out, "b d l -> (b l) d"), x_proj_weight)  # (bl d)
+        delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l=L)
         ctx.is_variable_B = B is None
         ctx.is_variable_C = C is None
         ctx.B_proj_bias_is_None = B_proj_bias is None
         ctx.C_proj_bias_is_None = C_proj_bias is None
         if B is None:  # variable B
-            B = x_dbl[:, delta_rank:delta_rank + d_state]  # (bl dstate)
+            B = x_dbl[:, delta_rank : delta_rank + d_state]  # (bl dstate)
             if B_proj_bias is not None:
                 B = B + B_proj_bias.to(dtype=B.dtype)
             if not A.is_complex():
@@ -402,17 +418,48 @@ class MambaInnerFn(torch.autograd.Function):
         ctx.checkpoint_lvl = checkpoint_lvl
         if checkpoint_lvl >= 1:  # Will recompute conv1d_out and delta in the backward pass
             conv1d_out, delta = None, None
-        ctx.save_for_backward(xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight,
-                              delta_proj_weight, out_proj_weight, conv1d_out, delta,
-                              A, B, C, D, delta_bias, scan_intermediates, out)
+        ctx.save_for_backward(
+            xz,
+            conv1d_weight,
+            conv1d_bias,
+            x_dbl,
+            x_proj_weight,
+            delta_proj_weight,
+            out_proj_weight,
+            conv1d_out,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            delta_bias,
+            scan_intermediates,
+            out,
+        )
         return F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
 
     @staticmethod
     @custom_bwd
     def backward(ctx, dout):
         # dout: (batch, seqlen, dim)
-        (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, out_proj_weight,
-         conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
+        (
+            xz,
+            conv1d_weight,
+            conv1d_bias,
+            x_dbl,
+            x_proj_weight,
+            delta_proj_weight,
+            out_proj_weight,
+            conv1d_out,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            delta_bias,
+            scan_intermediates,
+            out,
+        ) = ctx.saved_tensors
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
@@ -421,8 +468,7 @@ class MambaInnerFn(torch.autograd.Function):
             dout = dout.contiguous()
         if ctx.checkpoint_lvl == 1:
             conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias, True)
-            delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
-                              "d (b l) -> b d l", l = L)
+            delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l=L)
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         dxz = torch.empty_like(xz)  # (batch, dim, seqlen)
@@ -430,9 +476,20 @@ class MambaInnerFn(torch.autograd.Function):
         dout = rearrange(dout, "b l e -> e (b l)")
         dout_y = rearrange(out_proj_weight.t() @ dout, "d (b l) -> b d l", l=L)
         dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = selective_scan_cuda.bwd(
-            conv1d_out, delta, A, B, C, D, z, delta_bias, dout_y, scan_intermediates, out, dz,
+            conv1d_out,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z,
+            delta_bias,
+            dout_y,
+            scan_intermediates,
+            out,
+            dz,
             ctx.delta_softplus,
-            True  # option to recompute out_z
+            True,  # option to recompute out_z
         )
         dout_proj_weight = torch.einsum("eB,dB->ed", dout, rearrange(out_z, "b d l -> d (b l)"))
         dout_proj_bias = dout.sum(dim=(0, 1)) if not ctx.out_proj_bias_is_None else None
@@ -445,7 +502,7 @@ class MambaInnerFn(torch.autograd.Function):
             else:
                 dB = rearrange(dB, "b 1 dstate (l two) -> (b l) (dstate two)", two=2).contiguous()
             dB_proj_bias = dB.sum(0) if not ctx.B_proj_bias_is_None else None
-            dx_dbl[:, delta_rank:delta_rank + d_state] = dB  # (bl d)
+            dx_dbl[:, delta_rank : delta_rank + d_state] = dB  # (bl d)
             dB = None
         dC_proj_bias = None
         if ctx.is_variable_C:
@@ -470,29 +527,77 @@ class MambaInnerFn(torch.autograd.Function):
         )
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
-        return (dxz, dconv1d_weight, dconv1d_bias, dx_proj_weight, ddelta_proj_weight,
-                dout_proj_weight, dout_proj_bias,
-                dA, dB, dC, dD,
-                ddelta_bias if delta_bias is not None else None,
-                dB_proj_bias, dC_proj_bias, None)
+        return (
+            dxz,
+            dconv1d_weight,
+            dconv1d_bias,
+            dx_proj_weight,
+            ddelta_proj_weight,
+            dout_proj_weight,
+            dout_proj_bias,
+            dA,
+            dB,
+            dC,
+            dD,
+            ddelta_bias if delta_bias is not None else None,
+            dB_proj_bias,
+            dC_proj_bias,
+            None,
+        )
 
 
 def mamba_inner_fn(
-    xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-    out_proj_weight, out_proj_bias,
-    A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True
+    xz,
+    conv1d_weight,
+    conv1d_bias,
+    x_proj_weight,
+    delta_proj_weight,
+    out_proj_weight,
+    out_proj_bias,
+    A,
+    B=None,
+    C=None,
+    D=None,
+    delta_bias=None,
+    B_proj_bias=None,
+    C_proj_bias=None,
+    delta_softplus=True,
 ):
-    return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-                              out_proj_weight, out_proj_bias,
-                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus)
+    return MambaInnerFn.apply(
+        xz,
+        conv1d_weight,
+        conv1d_bias,
+        x_proj_weight,
+        delta_proj_weight,
+        out_proj_weight,
+        out_proj_bias,
+        A,
+        B,
+        C,
+        D,
+        delta_bias,
+        B_proj_bias,
+        C_proj_bias,
+        delta_softplus,
+    )
 
 
 def mamba_inner_ref(
-    xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-    out_proj_weight, out_proj_bias,
-    A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True
+    xz,
+    conv1d_weight,
+    conv1d_bias,
+    x_proj_weight,
+    delta_proj_weight,
+    out_proj_weight,
+    out_proj_bias,
+    A,
+    B=None,
+    C=None,
+    D=None,
+    delta_bias=None,
+    B_proj_bias=None,
+    C_proj_bias=None,
+    delta_softplus=True,
 ):
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]
@@ -502,11 +607,11 @@ def mamba_inner_ref(
     # We're being very careful here about the layout, to avoid extra transposes.
     # We want delta to have d as the slowest moving dimension
     # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-    x_dbl = F.linear(rearrange(x, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
+    x_dbl = F.linear(rearrange(x, "b d l -> (b l) d"), x_proj_weight)  # (bl d)
     delta = delta_proj_weight @ x_dbl[:, :delta_rank].t()
     delta = rearrange(delta, "d (b l) -> b d l", l=L)
     if B is None:  # variable B
-        B = x_dbl[:, delta_rank:delta_rank + d_state]  # (bl d)
+        B = x_dbl[:, delta_rank : delta_rank + d_state]  # (bl d)
         if B_proj_bias is not None:
             B = B + B_proj_bias.to(dtype=B.dtype)
         if not A.is_complex():
@@ -532,20 +637,40 @@ def mamba_inner_ref(
 @triton.jit
 def _selective_scan_update_kernel(
     # Pointers to matrices
-    state_ptr, x_ptr, dt_ptr, dt_bias_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
+    state_ptr,
+    x_ptr,
+    dt_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
     # Matrix dimensions
-    batch, dim, dstate,
+    batch,
+    dim,
+    dstate,
     # Strides
-    stride_state_batch, stride_state_dim, stride_state_dstate,
-    stride_x_batch, stride_x_dim,
-    stride_dt_batch, stride_dt_dim,
+    stride_state_batch,
+    stride_state_dim,
+    stride_state_dstate,
+    stride_x_batch,
+    stride_x_dim,
+    stride_dt_batch,
+    stride_dt_dim,
     stride_dt_bias_dim,
-    stride_A_dim, stride_A_dstate,
-    stride_B_batch, stride_B_dstate,
-    stride_C_batch, stride_C_dstate,
+    stride_A_dim,
+    stride_A_dstate,
+    stride_B_batch,
+    stride_B_dstate,
+    stride_C_batch,
+    stride_C_dstate,
     stride_D_dim,
-    stride_z_batch, stride_z_dim,
-    stride_out_batch, stride_out_dim,
+    stride_z_batch,
+    stride_z_dim,
+    stride_out_batch,
+    stride_out_dim,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -636,29 +761,52 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
     if dt_bias is not None:
         assert dt_bias.shape == (dim,)
     out = torch.empty_like(x)
-    grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch)
-    z_strides = ((z.stride(0), z.stride(1)) if z is not None else (0, 0))
+
+    def grid(META):
+        return triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch
+
+    z_strides = (z.stride(0), z.stride(1)) if z is not None else (0, 0)
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
-    BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16
-                               else ((16, 4) if dstate <= 32 else
-                                     ((8, 4) if dstate <= 64 else
-                                      ((4, 4) if dstate <= 128 else
-                                       ((4, 8))))))
+    BLOCK_SIZE_M, num_warps = (
+        (32, 4)
+        if dstate <= 16
+        else ((16, 4) if dstate <= 32 else ((8, 4) if dstate <= 64 else ((4, 4) if dstate <= 128 else ((4, 8)))))
+    )
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
-            state, x, dt, dt_bias, A, B, C, D, z, out,
-            batch, dim, dstate,
-            state.stride(0), state.stride(1), state.stride(2),
-            x.stride(0), x.stride(1),
-            dt.stride(0), dt.stride(1),
+            state,
+            x,
+            dt,
+            dt_bias,
+            A,
+            B,
+            C,
+            D,
+            z,
+            out,
+            batch,
+            dim,
+            dstate,
+            state.stride(0),
+            state.stride(1),
+            state.stride(2),
+            x.stride(0),
+            x.stride(1),
+            dt.stride(0),
+            dt.stride(1),
             dt_bias.stride(0) if dt_bias is not None else 0,
-            A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1),
-            C.stride(0), C.stride(1),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
             D.stride(0) if D is not None else 0,
-            z_strides[0], z_strides[1],
-            out.stride(0), out.stride(1),
+            z_strides[0],
+            z_strides[1],
+            out.stride(0),
+            out.stride(1),
             dt_softplus,
             BLOCK_SIZE_M,
             num_warps=num_warps,
@@ -744,9 +892,7 @@ def modify_logits_for_top_p_filtering(logits, top_p):
     # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
     sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
     # scatter sorted tensors to original indexing
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove
-    )
+    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
     logits.masked_fill_(indices_to_remove, float("-inf"))
 
 
@@ -774,9 +920,7 @@ def sample(logits, top_k=1, top_p=0.0, temperature=1.0):
             # Clone so that when we modify for top_p we don't change the original logits
             logits_top = logits / temperature if temperature != 1.0 else logits.clone()
             modify_logits_for_top_p_filtering(logits_top, top_p)
-            return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(
-                dim=-1
-            )
+            return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(dim=-1)
 
 
 @torch.inference_mode()
@@ -846,9 +990,7 @@ def decode(
                 num_last_tokens=1,
             ).logits.squeeze(dim=1)
         else:
-            logits = model._decoding_cache.run(
-                input_ids, position_ids, inference_params.seqlen_offset
-            ).squeeze(dim=1)
+            logits = model._decoding_cache.run(input_ids, position_ids, inference_params.seqlen_offset).squeeze(dim=1)
         return logits[..., :vocab_size] if vocab_size is not None else logits
 
     def sample_tokens(logits, inference_params):
@@ -905,9 +1047,7 @@ class GenerationMixin:
         output_scores=False,
         **kwargs,
     ):
-        output = decode(
-            input_ids, self, max_length, top_k=top_k, top_p=top_p, temperature=temperature, **kwargs
-        )
+        output = decode(input_ids, self, max_length, top_k=top_k, top_p=top_p, temperature=temperature, **kwargs)
         if not output_scores:
             output.scores = None
         return output if return_dict_in_generate else output.sequences
@@ -1017,9 +1157,7 @@ def update_graph_cache(
     return cache
 
 
-def capture_graph(
-    model, inference_params, batch_size, max_seqlen, decoding_seqlen=1, mempool=None, n_warmups=2
-):
+def capture_graph(model, inference_params, batch_size, max_seqlen, decoding_seqlen=1, mempool=None, n_warmups=2):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
     position_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
@@ -1079,7 +1217,7 @@ def load_state_dict_hf(model_name, device=None, dtype=None):
     return torch.load(resolved_archive_file, map_location=mapped_device)
     # Convert dtype before moving to GPU to save memory
     if dtype is not None:
-        state_dict = {k: v.to(dtype=dtype) for k, v in state_dict.items()}
+        state_dict = {k: v.to(dtype=dtype) for k, v in state_dict.items()}  # FIXME: bug in original code
     state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
     return state_dict
 
@@ -1094,9 +1232,7 @@ def layer_norm_ref(x, weight, bias, residual=None, eps=1e-6, prenorm=False, upca
         residual = residual.float() if residual is not None else residual
     if residual is not None:
         x = (x + residual).to(x.dtype)
-    out = F.layer_norm(x.to(weight.dtype), x.shape[-1:], weight=weight, bias=bias, eps=eps).to(
-        dtype
-    )
+    out = F.layer_norm(x.to(weight.dtype), x.shape[-1:], weight=weight, bias=bias, eps=eps).to(dtype)
     return out if not prenorm else (out, x)
 
 
@@ -1188,9 +1324,7 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y, mask=mask)
 
 
-def _layer_norm_fwd(
-    x, weight, bias, eps, residual=None, out_dtype=None, residual_dtype=None, is_rms_norm=False
-):
+def _layer_norm_fwd(x, weight, bias, eps, residual=None, out_dtype=None, residual_dtype=None, is_rms_norm=False):
     if residual is not None:
         residual_dtype = residual.dtype
     M, N = x.shape
@@ -1385,11 +1519,7 @@ def _layer_norm_bwd(
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
     # allocate output
-    dx = (
-        torch.empty_like(x)
-        if x_dtype is None
-        else torch.empty(M, N, dtype=x_dtype, device=x.device)
-    )
+    dx = torch.empty_like(x) if x_dtype is None else torch.empty(M, N, dtype=x_dtype, device=x.device)
     dresidual_in = torch.empty_like(x) if has_residual and dx.dtype != x.dtype else None
     y = torch.empty(M, N, dtype=dy.dtype, device=dy.device) if recompute_output else None
 
@@ -1400,11 +1530,7 @@ def _layer_norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
     _dw = torch.empty((sm_count, N), dtype=torch.float32, device=weight.device)
-    _db = (
-        torch.empty((sm_count, N), dtype=torch.float32, device=bias.device)
-        if bias is not None
-        else None
-    )
+    _db = torch.empty((sm_count, N), dtype=torch.float32, device=bias.device) if bias is not None else None
     rows_per_program = math.ceil(M / sm_count)
     grid = (sm_count,)
     with torch.cuda.device(x.device.index):
@@ -1471,11 +1597,7 @@ class LayerNormFn(torch.autograd.Function):
         weight = weight.contiguous()
         if bias is not None:
             bias = bias.contiguous()
-        residual_dtype = (
-            residual.dtype
-            if residual is not None
-            else (torch.float32 if residual_in_fp32 else None)
-        )
+        residual_dtype = residual.dtype if residual is not None else (torch.float32 if residual_in_fp32 else None)
         y, mean, rstd, residual_out = _layer_norm_fwd(
             x, weight, bias, eps, residual, residual_dtype=residual_dtype, is_rms_norm=is_rms_norm
         )
@@ -1600,11 +1722,7 @@ class LayerNormLinearFn(torch.autograd.Function):
         norm_weight = norm_weight.contiguous()
         if norm_bias is not None:
             norm_bias = norm_bias.contiguous()
-        residual_dtype = (
-            residual.dtype
-            if residual is not None
-            else (torch.float32 if residual_in_fp32 else None)
-        )
+        residual_dtype = residual.dtype if residual is not None else (torch.float32 if residual_in_fp32 else None)
         y, mean, rstd, residual_out = _layer_norm_fwd(
             x,
             norm_weight,
@@ -1750,9 +1868,7 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
@@ -1766,8 +1882,7 @@ class Mamba(nn.Module):
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
+            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
@@ -1929,20 +2044,15 @@ class Mamba(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
-        conv_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype
-        )
+        conv_state = torch.zeros(batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype)
         ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
         # ssm_dtype = torch.float32
-        ssm_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
-        )
+        ssm_state = torch.zeros(batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype)
         return conv_state, ssm_state
 
     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
         assert self.layer_idx is not None
         if self.layer_idx not in inference_params.key_value_memory_dict:
-            batch_shape = (batch_size,)
             conv_state = torch.zeros(
                 batch_size,
                 self.d_model * self.expand,
@@ -1969,9 +2079,7 @@ class Mamba(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(
-        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
-    ):
+    def __init__(self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
 
@@ -1995,9 +2103,7 @@ class Block(nn.Module):
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
-    def forward(
-        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
-    ):
+    def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None):
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -2042,9 +2148,7 @@ def create_block(
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
     mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
-    norm_cls = partial(
-        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
-    )
+    norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs)
     block = Block(
         d_model,
         mixer_cls,
@@ -2159,9 +2263,8 @@ class MambaModel(MambaPreTrainedModel):
         inference_params=None,
         # output_hidden_states: Optional[bool] = None, # TODO: implement
         return_dict: Optional[bool] = None,
-        **kwargs
+        **kwargs,
     ):
-
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is None and inputs_embeds is None:
@@ -2176,9 +2279,7 @@ class MambaModel(MambaPreTrainedModel):
 
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params
-            )
+            hidden_states, residual = layer(hidden_states, residual, inference_params=inference_params)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -2196,13 +2297,12 @@ class MambaModel(MambaPreTrainedModel):
             )
 
         if not return_dict:
-            return hidden_states,
+            return (hidden_states,)
 
         return BaseModelOutput(last_hidden_state=hidden_states)
 
 
 class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
-
     def __init__(
         self,
         config,
@@ -2218,7 +2318,7 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
-        self.apply( # TODO: that call looks duplicated; double-check
+        self.apply(  # TODO: that call looks duplicated; double-check
             partial(
                 _init_weights,
                 n_layer=config.n_layer,
@@ -2236,14 +2336,14 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor]=None,
+        position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         inference_params=None,
         num_last_tokens=0,
         # output_hidden_states: Optional[bool] = None, # TODO: implement
         return_dict: Optional[bool] = None,
-        **backbone_kwargs
+        **backbone_kwargs,
     ):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
@@ -2276,13 +2376,3 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutput(loss=loss, logits=logits)
-
-    # @classmethod
-    # def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
-    #     # config_args = load_config_hf(pretrained_model_name)
-    #     # config = MambaConfig(**config_args)
-    #     # model = cls(config, device=device, dtype=dtype, **kwargs)
-    #     print(kwargs)
-    #     model = cls(device=device, dtype=dtype, **kwargs)
-    #     model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
-    #     return model
