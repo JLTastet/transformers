@@ -563,6 +563,10 @@ _import_structure = {
         "LxmertTokenizer",
     ],
     "models.m2m_100": ["M2M_100_PRETRAINED_CONFIG_ARCHIVE_MAP", "M2M100Config"],
+    "models.mamba": [
+        "MAMBA_PRETRAINED_CONFIG_ARCHIVE_MAP",
+        "MambaConfig",
+    ],
     "models.marian": ["MarianConfig"],
     "models.markuplm": [
         "MARKUPLM_PRETRAINED_CONFIG_ARCHIVE_MAP",
@@ -2505,6 +2509,15 @@ else:
             "M2M100ForConditionalGeneration",
             "M2M100Model",
             "M2M100PreTrainedModel",
+        ]
+    )
+    _import_structure["models.mamba"].extend(
+        [
+            "MAMBA_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "Mamba",
+            "MambaModel",
+            "MambaForCausalLM",
+            "MambaPreTrainedModel",
         ]
     )
     _import_structure["models.marian"].extend(["MarianForCausalLM", "MarianModel", "MarianMTModel"])
@@ -5219,6 +5232,7 @@ if TYPE_CHECKING:
         LxmertTokenizer,
     )
     from .models.m2m_100 import M2M_100_PRETRAINED_CONFIG_ARCHIVE_MAP, M2M100Config
+    from .models.mamba import MAMBA_PRETRAINED_CONFIG_ARCHIVE_MAP, MambaConfig
     from .models.marian import MarianConfig
     from .models.markuplm import (
         MARKUPLM_PRETRAINED_CONFIG_ARCHIVE_MAP,
@@ -6959,6 +6973,13 @@ if TYPE_CHECKING:
             M2M100ForConditionalGeneration,
             M2M100Model,
             M2M100PreTrainedModel,
+        )
+        from .models.mamba import (
+            MAMBA_PRETRAINED_MODEL_ARCHIVE_LIST,
+            Mamba,
+            MambaModel,
+            MambaForCausalLM,
+            MambaPreTrainedModel,
         )
         from .models.marian import MarianForCausalLM, MarianModel, MarianMTModel
         from .models.markuplm import (
